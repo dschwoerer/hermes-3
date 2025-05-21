@@ -30,6 +30,7 @@
 #include <bout/field3d.hxx>
 #include <bout/fv_ops.hxx>
 #include <bout/vector3d.hxx>
+#include <bout/output_bout_types.hxx>
 
 /*!
  * Diffusion in index space
@@ -153,46 +154,58 @@ const Field3D Div_par_fvv(const Field3D& f_in, const Field3D& v_in,
     ASSERT1(f_in.hasParallelSlices());
     ASSERT1(v_in.hasParallelSlices());
 
+    const auto B = coord->Bxy;
+    const auto B_up = coord->Bxy.yup();
+    const auto B_down = coord->Bxy.ydown();
+
+    const auto f_up = f_in.yup();
+    const auto f_down = f_in.ydown();
+
+    const auto v_up = v_in.yup();
+    const auto v_down = v_in.ydown();
+
+    const auto g_22 = coord->g_22;
+    const auto dy = coord->dy;
+
     Field3D result{emptyFrom(f_in)};
+    BOUT_FOR(i, f_in.getRegion("RGN_NOBNDRY")) {
+      const auto iyp = i.yp();
+      const auto iym = i.ym();
 
-    for (int i = mesh->xstart; i <= mesh->xend; i++) {
-      for (int j = mesh->ystart; j <= mesh->yend; j++) {
-        for (int k = mesh->zstart; k <= mesh->zend; k++) {
-          // Value of f and v at left cell face
-          const BoutReal fL = 0.5 * (f_in(i, j, k) + f_in.ydown()(i, j - 1, k));
-          const BoutReal vL = 0.5 * (v_in(i, j, k) + v_in.ydown()(i, j - 1, k));
+      // Maximum local wave speed
+      const BoutReal amax = BOUTMAX(wave_speed_in[i],
+                                    fabs(v_in[i]),
+                                    fabs(v_up[iyp]),
+                                    fabs(v_down[iym]));
 
-          const BoutReal fR = 0.5 * (f_in(i, j, k) + f_in.yup()(i, j + 1, k));
-          const BoutReal vR = 0.5 * (v_in(i, j, k) + v_in.yup()(i, j + 1, k));
+      // result[i] = B[i] * (
+      //                     (f_up[iyp] * v_up[iyp] * v_up[iyp] / B_up[iyp])
+      //                     - (f_down[iym] * v_down[iym] * v_down[iym] / B_down[iym])
+      //                     // Penalty terms. This implementation is very dissipative.
+      //                     + amax * (f_in[i] * v_in[i] - f_up[iyp] * v_up[iyp]) / (B[i] + B_up[iyp])
+      //                     + amax * (f_in[i] * v_in[i] - f_down[iym] * v_down[iym]) / (B[i] + B_down[iym])
+      //                     )
+      //   / (2 * dy[i] * sqrt(g_22[i]));
 
-          // Reconstruct v at the cell faces
-          Stencil1D sv;
-          sv.c = v_in(i, j, k);
-          sv.m = v_in.ydown()(i, j - 1, k);
-          sv.p = v_in.yup()(i, j + 1, k);
-          cellboundary(sv);
+      result[i] = (0.5 * (f_in[i] * v_in[i] * (v_in[i] + amax) +
+                          f_up[iyp] * v_up[iyp] * (v_up[iyp] - amax))
+                   * (coord->J[i] + coord->J.yup()[iyp]) / (sqrt(g_22[i]) + sqrt(coord->g_22.yup()[iyp]))
+                   -
+                   0.5 * (f_in[i] * v_in[i] * (v_in[i] - amax) +
+                          f_down[iym] * v_down[iym] * (v_down[iym] + amax))
+                   * (coord->J[i] + coord->J.ydown()[iym]) / (sqrt(g_22[i]) + sqrt(coord->g_22.ydown()[iym])))
+        / (dy[i] * coord->J[i]);
 
-          // Maximum local wave speed
-          const BoutReal amax = BOUTMAX(wave_speed_in
-                                        (i, j, k),
-                                        fabs(v_in(i, j, k)),
-                                        fabs(v_in.yup()(i, j + 1, k)),
-                                        fabs(v_in.ydown()(i, j - 1, k)));
-
-          // Calculate flux at right boundary (y+1/2)
-          BoutReal fluxRight =
-            fR * (vR * vR  + amax * (sv.c - vR)) * (coord->J(i, j, k) + coord->J(i, j + 1, k))
-            / (sqrt(coord->g_22(i, j, k)) + sqrt(coord->g_22(i, j + 1, k)));
-
-          // Calculate at left boundary (y-1/2)
-          BoutReal fluxLeft =
-            fL * (vL * vL - amax * (sv.c - vL)) * (coord->J(i, j, k) + coord->J(i, j - 1, k))
-            / (sqrt(coord->g_22(i, j, k)) + sqrt(coord->g_22(i, j - 1, k)));
-
-          result(i, j, k) =
-            (fluxRight - fluxLeft) / (coord->dy(i, j, k) * coord->J(i, j, k));
-        }
+#if CHECK > 0
+      if(!std::isfinite(result[i])) {
+        throw BoutException("Non-finite value in Div_par_fvv at {}\n"
+                            "fup {} vup {} fdown {} vdown {} amax {}\n",
+                            "B {} Bup {} Bdown {} dy {} sqrt(g_22} {}",
+                            i,
+                            f_up[i], v_up[i], f_down[i], v_down[i], amax,
+                            B[i], B_up[i], B_down[i], dy[i], sqrt(g_22[i]));
       }
+#endif
     }
     return result;
   }
@@ -569,16 +582,47 @@ Field3D Div_par_mod(const Field3D& f_in, const Field3D& v_in,
                           const Field3D& wave_speed_in,
                           Field3D &flow_ylow, bool fixflux = true) {
 
+  Coordinates* coord = f_in.getCoordinates();
+
   if (f_in.isFci()){
     // Use mid-point (cell boundary) averages
     if (flow_ylow.isAllocated()) {
       flow_ylow = emptyFrom(flow_ylow);
     }
-    return Div_par(f_in, v_in);
+
+    ASSERT1(f_in.hasParallelSlices());
+    ASSERT1(v_in.hasParallelSlices());
+
+    const auto& f_up = f_in.yup();
+    const auto& f_down = f_in.ydown();
+
+    const auto& v_up = v_in.yup();
+    const auto& v_down = v_in.ydown();
+
+    Field3D result{emptyFrom(f_in)};
+    BOUT_FOR(i, f_in.getRegion("RGN_NOBNDRY")) {
+      const auto iyp = i.yp();
+      const auto iym = i.ym();
+
+      // Maximum local wave speed
+      const BoutReal amax = BOUTMAX(wave_speed_in[i],
+                                    fabs(v_in[i]),
+                                    fabs(v_up[iyp]),
+                                    fabs(v_down[iym]));
+
+      result[i] = (0.5 * (f_in[i] * (v_in[i] + amax) +
+                          f_up[iyp] * (v_up[iyp] - amax))
+                   * (coord->J[i] + coord->J.yup()[iyp]) / (sqrt(coord->g_22[i]) + sqrt(coord->g_22.yup()[iyp]))
+                   -
+                   0.5 * (f_in[i] * (v_in[i] - amax) +
+                          f_down[iym] * (v_down[iym] + amax))
+                   * (coord->J[i] + coord->J.ydown()[iym]) / (sqrt(coord->g_22[i]) + sqrt(coord->g_22.ydown()[iym])))
+        / (coord->dy[i] * coord->J[i]);
+    }
+    return result;
   }
   ASSERT1_FIELDS_COMPATIBLE(f_in, v_in);
   ASSERT1_FIELDS_COMPATIBLE(f_in, wave_speed_in);
-
 
   Mesh* mesh = f_in.getMesh();
 
@@ -595,8 +639,6 @@ Field3D Div_par_mod(const Field3D& f_in, const Field3D& v_in,
   Field3D v = are_unaligned ? toFieldAligned(v_in, "RGN_NOX") : v_in;
   Field3D wave_speed =
       are_unaligned ? toFieldAligned(wave_speed_in, "RGN_NOX") : wave_speed_in;
-
-  Coordinates* coord = f_in.getCoordinates();
 
   Field3D result{zeroFrom(f)};
   flow_ylow = zeroFrom(f);

@@ -46,6 +46,10 @@ EvolveMomentum::EvolveMomentum(std::string name, Options &alloptions, Solver *so
                       .doc("Allow flows through radial boundaries")
                       .withDefault<bool>(true);
 
+  exb_advection = options["exb_advection"]
+                   .doc("Include ExB advection?")
+                   .withDefault<bool>(true);
+
   poloidal_flows = options["poloidal_flows"]
                        .doc("Include poloidal ExB flow")
                        .withDefault<bool>(true);
@@ -64,6 +68,17 @@ EvolveMomentum::EvolveMomentum(std::string name, Options &alloptions, Solver *so
 
   // Set to zero so set for output
   momentum_source = 0.0;
+
+  if (mesh->isFci()) {
+    const auto coord = mesh->getCoordinates();
+    // Note: This is 1 for a Clebsch coordinate system
+    //       Remove parallel slices before operations
+    bracket_factor = sqrt(coord->g_22.withoutParallelSlices())
+      / (coord->J.withoutParallelSlices() * coord->Bxy);
+  } else {
+    // Clebsch coordinate system
+    bracket_factor = 1.0;
+  }
 }
 
 void EvolveMomentum::transform(Options &state) {
@@ -88,15 +103,12 @@ void EvolveMomentum::transform(Options &state) {
   V = NV / (AA * Nlim);
   V.name = Vname;
   mesh->communicate(V);
+  V.applyParallelBoundary();
   set(species["velocity"], V);
 
   NV_solver = NV; // Save the momentum as calculated by the solver
   NV = AA * N * V; // Re-calculate consistent with V and N
-  if (NV.isFci()) {
-    NV.splitParallelSlices();
-    NV.yup() = AA * N.yup() * V.yup();
-    NV.ydown() = AA * N.ydown() * V.ydown();
-  }
+
   if (tracking) {
     saveParallel(*tracking, fmt::format("NV{}_initial", name), NV);
     saveParallel(*tracking, fmt::format("N{}_initial",name), N);
@@ -144,8 +156,12 @@ void EvolveMomentum::finally(const Options &state) {
 
       const Field3D phi = get<Field3D>(state["fields"]["phi"]);
 
-      ddt(NV) = -Div_n_bxGrad_f_B_XPPM(NV, phi, bndry_flux, poloidal_flows,
-                                       true); // ExB drift
+      if (exb_advection) {
+        ddt(NV) = -Div_n_bxGrad_f_B_XPPM(NV, phi, bndry_flux, poloidal_flows,
+                                         true) * bracket_factor; // ExB drift
+      } else {
+        ddt(NV) = 0.0;
+      }
 
       // Parallel electric field
       // Force density = - Z N ∇ϕ
@@ -164,8 +180,12 @@ void EvolveMomentum::finally(const Options &state) {
         // This is Z * Apar * dn/dt, keeping just leading order terms
         Field3D dndt = density_source
           - FV::Div_par_mod<hermes::Limiter>(N, V, fastest_wave, dummy)
-          - Div_n_bxGrad_f_B_XPPM(N, phi, bndry_flux, poloidal_flows, true)
           ;
+
+        if (exb_advection) {
+          dndt -= Div_n_bxGrad_f_B_XPPM(N, phi, bndry_flux, poloidal_flows, true) * bracket_factor;
+        }
+
         if (low_n_diffuse_perp) {
           dndt += Div_Perp_Lap_FV_Index(density_floor / floor(N, 1e-3 * density_floor), N,
                                         bndry_flux);
@@ -178,7 +198,7 @@ void EvolveMomentum::finally(const Options &state) {
 
         // Using the approximation for small delta-B/B
         // b dot Grad(phi) = Grad_par(phi) + [phi, Apar]
-        ddt(NV) -= Z * N * bracket(phi, Apar_flutter, BRACKET_ARAKAWA);
+        ddt(NV) -= Z * N * bracket(phi, Apar_flutter, BRACKET_ARAKAWA) * bracket_factor;
       }
     } else {
       ddt(NV) = 0.0;
